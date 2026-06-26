@@ -7,6 +7,9 @@ const PORT = process.env.PORT || 3000;
 const SHOP                = process.env.SHOPIFY_SHOP;
 const TOKEN               = process.env.SHOPIFY_ADMIN_TOKEN;
 const WEBHOOK_SECRET      = process.env.SHOPIFY_WEBHOOK_SECRET;
+const SYNC_SECRET         = process.env.SYNC_SECRET;
+const CLIENT_ID           = process.env.SHOPIFY_CLIENT_ID;
+const CLIENT_SECRET       = process.env.SHOPIFY_CLIENT_SECRET;
 const CHINA_LOCATION_ID   = 'gid://shopify/Location/66392490056';
 const DAN_LOCATION_ID     = 'gid://shopify/Location/63623921736';
 const CHINA_TAG           = 'ships-from-future-china';
@@ -33,9 +36,7 @@ async function getProductForInventoryItem(inventoryItemId) {
       inventoryItem(id: $id) {
         variant {
           product {
-            id
-            title
-            tags
+            id title tags
             variants(first: 50) {
               nodes {
                 inventoryItem {
@@ -56,29 +57,6 @@ async function getProductForInventoryItem(inventoryItemId) {
   return data?.inventoryItem?.variant?.product ?? null;
 }
 
-async function getProductById(productGid) {
-  const data = await gql(`
-    query ($id: ID!) {
-      product(id: $id) {
-        id title tags
-        variants(first: 50) {
-          nodes {
-            inventoryItem {
-              inventoryLevels(first: 10) {
-                nodes {
-                  quantities(names: ["available"]) { quantity }
-                  location { id }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  `, { id: productGid });
-  return data?.product ?? null;
-}
-
 function shouldBeTagged(product) {
   return product.variants.nodes.some(variant => {
     const levels = variant.inventoryItem.inventoryLevels.nodes;
@@ -91,31 +69,18 @@ function shouldBeTagged(product) {
 async function syncProductTag(product) {
   const isTagged = product.tags.includes(CHINA_TAG);
   const needsTag = shouldBeTagged(product);
-
   if (needsTag && !isTagged) {
-    await gql(`mutation ($id: ID!, $tags: [String!]!) { tagsAdd(id: $id, tags: $tags) { userErrors { message } } }`,
-      { id: product.id, tags: [CHINA_TAG] });
+    await gql(`mutation ($id: ID!, $tags: [String!]!) { tagsAdd(id: $id, tags: $tags) { userErrors { message } } }`, { id: product.id, tags: [CHINA_TAG] });
     console.log(`✅ Tagged: ${product.title}`);
   } else if (!needsTag && isTagged) {
-    await gql(`mutation ($id: ID!, $tags: [String!]!) { tagsRemove(id: $id, tags: $tags) { userErrors { message } } }`,
-      { id: product.id, tags: [CHINA_TAG] });
+    await gql(`mutation ($id: ID!, $tags: [String!]!) { tagsRemove(id: $id, tags: $tags) { userErrors { message } } }`, { id: product.id, tags: [CHINA_TAG] });
     console.log(`🔄 Untagged: ${product.title}`);
   } else {
     console.log(`⏭️  No change: ${product.title}`);
   }
 }
 
-// ── Webhook verification ──────────────────────────────────────────────────────
-function verifyWebhook(rawBody, hmacHeader) {
-  if (!WEBHOOK_SECRET) return true; // skip in dev
-  const digest = crypto
-    .createHmac('sha256', WEBHOOK_SECRET)
-    .update(rawBody)
-    .digest('base64');
-  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
-}
-
-// ── Raw body capture (needed for HMAC verification) ───────────────────────────
+// ── Raw body capture ──────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   let data = '';
   req.on('data', chunk => (data += chunk));
@@ -126,106 +91,122 @@ app.use((req, res, next) => {
   });
 });
 
-// ── Health check ──────────────────────────────────────────────────────────────
-app.get('/', (req, res) => res.send('Future China Sync — running ✅'));
+// ── OAuth install handler ─────────────────────────────────────────────────────
+// Step 1: Shopify redirects here with ?shop=... to start OAuth
+app.get('/', (req, res) => {
+  const shop = req.query.shop;
+
+  // If no shop param, just show status
+  if (!shop) return res.send('Future China Sync — running ✅');
+
+  // If we already have a token configured, show running
+  if (TOKEN) return res.send('Future China Sync — running ✅');
+
+  // Otherwise start OAuth
+  const scopes = 'read_products,write_products,read_inventory';
+  const redirectUri = `https://future-china-sync.onrender.com/auth/callback`;
+  const authUrl = `https://${shop}/admin/oauth/authorize?client_id=${CLIENT_ID}&scope=${scopes}&redirect_uri=${redirectUri}`;
+  res.redirect(authUrl);
+});
+
+// Step 2: Shopify sends back a code — exchange it for a token
+app.get('/auth/callback', async (req, res) => {
+  const { shop, code } = req.query;
+
+  try {
+    const response = await fetch(`https://${shop}/admin/oauth/access_token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+        code,
+      }),
+    });
+    const data = await response.json();
+    const accessToken = data.access_token;
+
+    // Display the token prominently
+    res.send(`
+      <html>
+        <body style="font-family:sans-serif;max-width:600px;margin:50px auto;padding:20px">
+          <h1>✅ App Installed Successfully!</h1>
+          <p>Copy this Admin API access token and add it to your Render environment variables as <strong>SHOPIFY_ADMIN_TOKEN</strong>:</p>
+          <div style="background:#f0f0f0;padding:15px;border-radius:8px;word-break:break-all;font-family:monospace;font-size:14px">
+            ${accessToken}
+          </div>
+          <p style="color:red"><strong>⚠️ Copy this now — it will not be shown again!</strong></p>
+          <p>After adding it to Render, your sync server will be fully operational.</p>
+        </body>
+      </html>
+    `);
+
+    console.log(`\n🔑 ACCESS TOKEN FOR ${shop}:\n${accessToken}\n`);
+  } catch (err) {
+    res.send(`Error: ${err.message}`);
+  }
+});
+
+// ── Webhook verification ──────────────────────────────────────────────────────
+function verifyWebhook(rawBody, hmacHeader) {
+  if (!WEBHOOK_SECRET) return true;
+  const digest = crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('base64');
+  return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
+}
 
 // ── Webhook: inventory_levels/update ─────────────────────────────────────────
-// Fires whenever stock changes at any location
 app.post('/webhooks/inventory-level-update', async (req, res) => {
   const hmac = req.headers['x-shopify-hmac-sha256'];
-  if (!verifyWebhook(req.rawBody, hmac)) {
-    return res.status(401).send('Unauthorized');
-  }
-
-  res.sendStatus(200); // Shopify needs a fast 200
-
+  if (!verifyWebhook(req.rawBody, hmac)) return res.status(401).send('Unauthorized');
+  res.sendStatus(200);
   try {
     const { inventory_item_id } = req.body;
     if (!inventory_item_id) return;
-
     console.log(`📦 Inventory update for item: ${inventory_item_id}`);
     const product = await getProductForInventoryItem(inventory_item_id);
-    if (!product) return console.log('  ↳ No product found, skipping');
-
+    if (!product) return;
     await syncProductTag(product);
   } catch (err) {
-    console.error('Error handling webhook:', err.message);
+    console.error('Webhook error:', err.message);
   }
 });
 
 // ── Webhook: products/update ──────────────────────────────────────────────────
-// Catches any other product changes (e.g. variant added)
 app.post('/webhooks/product-update', async (req, res) => {
   const hmac = req.headers['x-shopify-hmac-sha256'];
-  if (!verifyWebhook(req.rawBody, hmac)) {
-    return res.status(401).send('Unauthorized');
-  }
-
+  if (!verifyWebhook(req.rawBody, hmac)) return res.status(401).send('Unauthorized');
   res.sendStatus(200);
-
   try {
     const { id } = req.body;
     if (!id) return;
-
-    const product = await getProductById(`gid://shopify/Product/${id}`);
-    if (!product) return;
-
-    await syncProductTag(product);
+    const data = await gql(`query ($id: ID!) { product(id: $id) { id title tags variants(first: 50) { nodes { inventoryItem { inventoryLevels(first: 10) { nodes { quantities(names: ["available"]) { quantity } location { id } } } } } } } }`, { id: `gid://shopify/Product/${id}` });
+    if (data?.product) await syncProductTag(data.product);
   } catch (err) {
-    console.error('Error handling product webhook:', err.message);
+    console.error('Product webhook error:', err.message);
   }
 });
 
-// ── Manual full sync endpoint ─────────────────────────────────────────────────
+// ── Manual full sync ──────────────────────────────────────────────────────────
 app.post('/sync-all', async (req, res) => {
-  const auth = req.headers['x-sync-secret'];
-  if (auth !== process.env.SYNC_SECRET) return res.status(401).send('Unauthorized');
-
+  if (req.headers['x-sync-secret'] !== SYNC_SECRET) return res.status(401).send('Unauthorized');
   res.send('Full sync started — check server logs');
-
   console.log('\n🔄 Manual full sync triggered...');
-  let cursor = null;
-  let tagged = 0, untagged = 0, skipped = 0;
-
+  let cursor = null, tagged = 0, untagged = 0, skipped = 0;
   try {
     do {
-      const data = await gql(`
-        query ($cursor: String) {
-          products(first: 50, after: $cursor) {
-            pageInfo { hasNextPage endCursor }
-            nodes {
-              id title tags
-              variants(first: 50) {
-                nodes {
-                  inventoryItem {
-                    inventoryLevels(first: 10) {
-                      nodes {
-                        quantities(names: ["available"]) { quantity }
-                        location { id }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      `, { cursor });
-
+      const data = await gql(`query ($cursor: String) { products(first: 50, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { id title tags variants(first: 50) { nodes { inventoryItem { inventoryLevels(first: 10) { nodes { quantities(names: ["available"]) { quantity } location { id } } } } } } } } }`, { cursor });
       for (const product of data.products.nodes) {
         const isTagged = product.tags.includes(CHINA_TAG);
         const needsTag = shouldBeTagged(product);
-        if (needsTag && !isTagged) { await gql(`mutation ($id: ID!, $tags: [String!]!) { tagsAdd(id: $id, tags: $tags) { userErrors { message } } }`, { id: product.id, tags: [CHINA_TAG] }); console.log(`✅ Tagged: ${product.title}`); tagged++; }
-        else if (!needsTag && isTagged) { await gql(`mutation ($id: ID!, $tags: [String!]!) { tagsRemove(id: $id, tags: $tags) { userErrors { message } } }`, { id: product.id, tags: [CHINA_TAG] }); console.log(`🔄 Untagged: ${product.title}`); untagged++; }
+        if (needsTag && !isTagged) { await gql(`mutation ($id: ID!, $tags: [String!]!) { tagsAdd(id: $id, tags: $tags) { userErrors { message } } }`, { id: product.id, tags: [CHINA_TAG] }); tagged++; }
+        else if (!needsTag && isTagged) { await gql(`mutation ($id: ID!, $tags: [String!]!) { tagsRemove(id: $id, tags: $tags) { userErrors { message } } }`, { id: product.id, tags: [CHINA_TAG] }); untagged++; }
         else skipped++;
       }
-
       cursor = data.products.pageInfo.hasNextPage ? data.products.pageInfo.endCursor : null;
     } while (cursor);
-
-    console.log(`\n✅ Full sync done — Tagged: ${tagged}, Untagged: ${untagged}, Skipped: ${skipped}`);
+    console.log(`✅ Done — Tagged: ${tagged}, Untagged: ${untagged}, Skipped: ${skipped}`);
   } catch (err) {
-    console.error('Full sync error:', err.message);
+    console.error('Sync error:', err.message);
   }
 });
 
