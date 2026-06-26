@@ -12,12 +12,9 @@ const CLIENT_ID         = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET     = process.env.SHOPIFY_CLIENT_SECRET;
 const CHINA_LOCATION_ID = 'gid://shopify/Location/66392490056';
 const DAN_LOCATION_ID   = 'gid://shopify/Location/63623921736';
-
-// Metafield that gets written to each variant
 const META_NAMESPACE    = 'shipping';
 const META_KEY          = 'from_china';
 
-// ── GraphQL helper ────────────────────────────────────────────────────────────
 async function gql(query, variables = {}) {
   const res = await fetch(`https://${SHOP}/admin/api/2025-10/graphql.json`, {
     method: 'POST',
@@ -32,84 +29,66 @@ async function gql(query, variables = {}) {
   return json.data;
 }
 
-// ── Set or remove metafield on a variant ─────────────────────────────────────
-async function setVariantMetafield(variantId, value) {
-  await gql(`
-    mutation ($input: ProductVariantInput!) {
-      productVariantUpdate(input: $input) {
-        userErrors { message field }
-      }
-    }
-  `, {
-    input: {
-      id: variantId,
-      metafields: [{
-        namespace: META_NAMESPACE,
-        key: META_KEY,
-        type: 'boolean',
-        value: String(value),
-      }],
-    },
-  });
-}
-
-// ── Get inventory levels for a variant's inventory item ───────────────────────
-function getLocationQty(levels, locationId) {
+function getQty(levels, locationId) {
   return levels.find(l => l.location.id === locationId)?.quantities[0]?.quantity ?? 0;
 }
 
-// ── Sync all variants of a product ───────────────────────────────────────────
 async function syncProduct(product) {
-  let tagged = 0, untagged = 0, skipped = 0;
+  const toUpdate = [];
 
   for (const variant of product.variants.nodes) {
     const levels = variant.inventoryItem.inventoryLevels.nodes;
-    const chinaQty = getLocationQty(levels, CHINA_LOCATION_ID);
-    const danQty   = getLocationQty(levels, DAN_LOCATION_ID);
-
-    // This variant ships from China only if:
-    // - it has stock at Future China
-    // - it has NO stock at Future Fulfilment Dan
+    const chinaQty = getQty(levels, CHINA_LOCATION_ID);
+    const danQty   = getQty(levels, DAN_LOCATION_ID);
     const shouldBeChina = chinaQty > 0 && danQty === 0;
-
-    // Read existing metafield value
-    const existing = variant.metafields?.nodes?.find(
+    const currentValue = variant.metafields.nodes.find(
       m => m.namespace === META_NAMESPACE && m.key === META_KEY
-    );
-    const currentValue = existing?.value === 'true';
+    )?.value;
 
-    if (shouldBeChina && !currentValue) {
-      await setVariantMetafield(variant.id, true);
-      console.log(`  ✅ China: ${product.title} / ${variant.title} (SKU: ${variant.sku})`);
-      tagged++;
-    } else if (!shouldBeChina && currentValue) {
-      await setVariantMetafield(variant.id, false);
-      console.log(`  🔄 Not China: ${product.title} / ${variant.title} (SKU: ${variant.sku})`);
-      untagged++;
-    } else {
-      skipped++;
+    if (shouldBeChina && currentValue !== 'true') {
+      toUpdate.push({ id: variant.id, value: 'true' });
+      console.log(`  ✅ SET: ${product.title} / ${variant.title}`);
+    } else if (!shouldBeChina && currentValue === 'true') {
+      toUpdate.push({ id: variant.id, value: 'false' });
+      console.log(`  🔄 CLEAR: ${product.title} / ${variant.title}`);
     }
   }
 
-  return { tagged, untagged, skipped };
+  if (toUpdate.length > 0) {
+    await gql(`
+      mutation ($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+        productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+          userErrors { field message }
+        }
+      }
+    `, {
+      productId: product.id,
+      variants: toUpdate.map(v => ({
+        id: v.id,
+        metafields: [{ namespace: META_NAMESPACE, key: META_KEY, type: 'boolean', value: v.value }]
+      }))
+    });
+  }
 }
 
-// ── Fetch full product with variants + inventory ──────────────────────────────
 const PRODUCT_QUERY = `
-  query ($id: ID!) {
-    product(id: $id) {
-      id title
-      variants(first: 50) {
-        nodes {
-          id title sku
-          metafields(first: 10, namespace: "shipping") {
-            nodes { namespace key value }
-          }
-          inventoryItem {
-            inventoryLevels(first: 10) {
-              nodes {
-                quantities(names: ["available"]) { quantity }
-                location { id }
+  query ($cursor: String) {
+    products(first: 10, after: $cursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id title
+        variants(first: 50) {
+          nodes {
+            id title sku
+            metafields(first: 10, namespace: "shipping") {
+              nodes { namespace key value }
+            }
+            inventoryItem {
+              inventoryLevels(first: 10) {
+                nodes {
+                  quantities(names: ["available"]) { quantity }
+                  location { id }
+                }
               }
             }
           }
@@ -119,8 +98,30 @@ const PRODUCT_QUERY = `
   }
 `;
 
-async function getProduct(productGid) {
-  const data = await gql(PRODUCT_QUERY, { id: productGid });
+async function getProductById(productGid) {
+  const data = await gql(`
+    query ($id: ID!) {
+      product(id: $id) {
+        id title
+        variants(first: 50) {
+          nodes {
+            id title sku
+            metafields(first: 10, namespace: "shipping") {
+              nodes { namespace key value }
+            }
+            inventoryItem {
+              inventoryLevels(first: 10) {
+                nodes {
+                  quantities(names: ["available"]) { quantity }
+                  location { id }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `, { id: productGid });
   return data?.product ?? null;
 }
 
@@ -134,10 +135,9 @@ async function getProductForInventoryItem(inventoryItemId) {
   `, { id: `gid://shopify/InventoryItem/${inventoryItemId}` });
   const productId = data?.inventoryItem?.variant?.product?.id;
   if (!productId) return null;
-  return getProduct(productId);
+  return getProductById(productId);
 }
 
-// ── Raw body capture ──────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   let data = '';
   req.on('data', chunk => (data += chunk));
@@ -148,7 +148,6 @@ app.use((req, res, next) => {
   });
 });
 
-// ── OAuth ─────────────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   const shop = req.query.shop;
   if (!shop) return res.send('Future China Sync — running ✅');
@@ -181,14 +180,12 @@ app.get('/auth/callback', async (req, res) => {
   }
 });
 
-// ── Webhook verification ──────────────────────────────────────────────────────
 function verifyWebhook(rawBody, hmacHeader) {
   if (!WEBHOOK_SECRET || !hmacHeader) return true;
   const digest = crypto.createHmac('sha256', WEBHOOK_SECRET).update(rawBody).digest('base64');
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmacHeader));
 }
 
-// ── Webhook: inventory_levels/update ─────────────────────────────────────────
 app.post('/webhooks/inventory-level-update', async (req, res) => {
   if (!verifyWebhook(req.rawBody, req.headers['x-shopify-hmac-sha256'])) return res.status(401).send('Unauthorized');
   res.sendStatus(200);
@@ -203,76 +200,40 @@ app.post('/webhooks/inventory-level-update', async (req, res) => {
   }
 });
 
-// ── Webhook: products/update ──────────────────────────────────────────────────
 app.post('/webhooks/product-update', async (req, res) => {
   if (!verifyWebhook(req.rawBody, req.headers['x-shopify-hmac-sha256'])) return res.status(401).send('Unauthorized');
   res.sendStatus(200);
   try {
     const { id } = req.body;
     if (!id) return;
-    const product = await getProduct(`gid://shopify/Product/${id}`);
+    const product = await getProductById(`gid://shopify/Product/${id}`);
     if (product) await syncProduct(product);
   } catch (err) {
     console.error('Product webhook error:', err.message);
   }
 });
 
-// ── Manual full sync ──────────────────────────────────────────────────────────
 app.post('/sync-all', async (req, res) => {
   if (req.headers['x-sync-secret'] !== SYNC_SECRET) return res.status(401).send('Unauthorized');
   res.send('Full sync started — check server logs');
-  console.log('\n🔄 Full variant sync starting...');
-
+  console.log('\n🔄 Full sync starting...');
   let cursor = null;
-  let totalTagged = 0, totalUntagged = 0, totalSkipped = 0;
+  let totalSet = 0, totalCleared = 0;
 
   try {
     do {
-      const data = await gql(`
-        query ($cursor: String) {
-          products(first: 10, after: $cursor) {
-            pageInfo { hasNextPage endCursor }
-            nodes {
-              id title
-              variants(first: 50) {
-                nodes {
-                  id title sku
-                  metafields(first: 10, namespace: "shipping") {
-                    nodes { namespace key value }
-                  }
-                  inventoryItem {
-                    inventoryLevels(first: 10) {
-                      nodes {
-                        quantities(names: ["available"]) { quantity }
-                        location { id }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      `, { cursor });
-
+      const data = await gql(PRODUCT_QUERY, { cursor });
       for (const product of data.products.nodes) {
-        console.log(`\n📦 ${product.title}`);
-        const result = await syncProduct(product);
-        totalTagged   += result.tagged;
-        totalUntagged += result.untagged;
-        totalSkipped  += result.skipped;
+        const before = { set: totalSet, cleared: totalCleared };
+        await syncProduct(product);
       }
-
       cursor = data.products.pageInfo.hasNextPage ? data.products.pageInfo.endCursor : null;
     } while (cursor);
-
     console.log(`\n✅ Full sync done!`);
-    console.log(`   Variants set to China: ${totalTagged}`);
-    console.log(`   Variants removed from China: ${totalUntagged}`);
-    console.log(`   No change: ${totalSkipped}`);
   } catch (err) {
     console.error('Sync error:', err.message);
   }
 });
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+
