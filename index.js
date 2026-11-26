@@ -10,10 +10,15 @@ const WEBHOOK_SECRET    = process.env.SHOPIFY_WEBHOOK_SECRET;
 const SYNC_SECRET       = process.env.SYNC_SECRET;
 const CLIENT_ID         = process.env.SHOPIFY_CLIENT_ID;
 const CLIENT_SECRET     = process.env.SHOPIFY_CLIENT_SECRET;
+const SHIPHERO_TOKEN    = process.env.SHIPHERO_TOKEN;
+
 const CHINA_LOCATION_ID = 'gid://shopify/Location/66392490056';
 const DAN_LOCATION_ID   = 'gid://shopify/Location/63623921736';
 const META_NAMESPACE    = 'shipping';
-const META_KEY          = 'from_china';
+const META_KEY_CHINA    = 'from_china';
+const META_KEY_PREORDER = 'preorder_dandenong';
+
+// ── Shopify GraphQL ──────────────────────────────────────────────────────────
 
 async function gql(query, variables = {}) {
   const res = await fetch(`https://${SHOP}/admin/api/2025-10/graphql.json`, {
@@ -33,24 +38,142 @@ function getQty(levels, locationId) {
   return levels.find(l => l.location.id === locationId)?.quantities[0]?.quantity ?? 0;
 }
 
+// ── ShipHero GraphQL ─────────────────────────────────────────────────────────
+
+/**
+ * Query ShipHero for a SKU's on_hand quantity and whether it has an active
+ * purchase order (incoming stock). Returns { onHand, hasPO }.
+ */
+async function getShipHeroSkuStatus(sku) {
+  if (!SHIPHERO_TOKEN || !sku) return { onHand: null, hasPO: false };
+
+  try {
+    // 1. Get on-hand quantity for this SKU
+    const productRes = await fetch('https://public-api.shiphero.com/graphql', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${SHIPHERO_TOKEN}`,
+      },
+      body: JSON.stringify({
+        query: `
+          query ($sku: String) {
+            product(sku: $sku) {
+              data {
+                sku
+                on_hand
+              }
+            }
+          }
+        `,
+        variables: { sku },
+      }),
+    });
+    const productJson = await productRes.json();
+    const onHand = productJson?.data?.product?.data?.on_hand ?? null;
+
+    // 2. Check for open purchase orders containing this SKU
+    const poRes = await fetch('https://public-api.shiphero.com/graphql', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${SHIPHERO_TOKEN}`,
+      },
+      body: JSON.stringify({
+        query: `
+          query {
+            purchase_orders(status: "open") {
+              data {
+                edges {
+                  node {
+                    po_number
+                    line_items {
+                      edges {
+                        node {
+                          sku
+                          quantity
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        `,
+      }),
+    });
+    const poJson = await poRes.json();
+    const orders = poJson?.data?.purchase_orders?.data?.edges ?? [];
+    const hasPO = orders.some(edge =>
+      edge.node.line_items?.edges?.some(li => li.node.sku === sku && li.node.quantity > 0)
+    );
+
+    return { onHand, hasPO };
+  } catch (err) {
+    console.error(`ShipHero error for SKU ${sku}:`, err.message);
+    return { onHand: null, hasPO: false };
+  }
+}
+
+/**
+ * A SKU is a Dandenong preorder when:
+ *   - ShipHero on_hand <= 0 (zero or negative)
+ *   - AND there is an active purchase order for it in ShipHero
+ */
+async function isPreorderDandenong(sku) {
+  const { onHand, hasPO } = await getShipHeroSkuStatus(sku);
+  if (onHand === null) return false; // couldn't determine
+  return onHand <= 0 && hasPO;
+}
+
+// ── Product sync ─────────────────────────────────────────────────────────────
+
 async function syncProduct(product) {
   const toUpdate = [];
 
   for (const variant of product.variants.nodes) {
-    const levels = variant.inventoryItem.inventoryLevels.nodes;
+    const levels   = variant.inventoryItem.inventoryLevels.nodes;
     const chinaQty = getQty(levels, CHINA_LOCATION_ID);
     const danQty   = getQty(levels, DAN_LOCATION_ID);
-    const shouldBeChina = chinaQty > 0 && danQty === 0;
-    const currentValue = variant.metafields.nodes.find(
-      m => m.namespace === META_NAMESPACE && m.key === META_KEY
+
+    // ── from_china metafield ─────────────────────────────────────────────────
+    const shouldBeChina   = chinaQty > 0 && danQty === 0;
+    const currentChina    = variant.metafields.nodes.find(
+      m => m.namespace === META_NAMESPACE && m.key === META_KEY_CHINA
     )?.value;
 
-    if (shouldBeChina && currentValue !== 'true') {
-      toUpdate.push({ id: variant.id, value: 'true' });
-      console.log(`  ✅ SET: ${product.title} / ${variant.title}`);
-    } else if (!shouldBeChina && currentValue === 'true') {
-      toUpdate.push({ id: variant.id, value: 'false' });
-      console.log(`  🔄 CLEAR: ${product.title} / ${variant.title}`);
+    // ── preorder_dandenong metafield ─────────────────────────────────────────
+    // A variant is a Dandenong preorder when danQty <= 0 AND ShipHero has a PO
+    const currentPreorder = variant.metafields.nodes.find(
+      m => m.namespace === META_NAMESPACE && m.key === META_KEY_PREORDER
+    )?.value;
+
+    let shouldBePreorder = false;
+    if (danQty <= 0 && variant.sku) {
+      shouldBePreorder = await isPreorderDandenong(variant.sku);
+    }
+
+    const metafields = [];
+
+    if (shouldBeChina && currentChina !== 'true') {
+      metafields.push({ namespace: META_NAMESPACE, key: META_KEY_CHINA, type: 'boolean', value: 'true' });
+      console.log(`  ✅ SET from_china: ${product.title} / ${variant.title}`);
+    } else if (!shouldBeChina && currentChina === 'true') {
+      metafields.push({ namespace: META_NAMESPACE, key: META_KEY_CHINA, type: 'boolean', value: 'false' });
+      console.log(`  🔄 CLEAR from_china: ${product.title} / ${variant.title}`);
+    }
+
+    if (shouldBePreorder && currentPreorder !== 'true') {
+      metafields.push({ namespace: META_NAMESPACE, key: META_KEY_PREORDER, type: 'boolean', value: 'true' });
+      console.log(`  🛒 SET preorder_dandenong: ${product.title} / ${variant.title} (SKU: ${variant.sku})`);
+    } else if (!shouldBePreorder && currentPreorder === 'true') {
+      metafields.push({ namespace: META_NAMESPACE, key: META_KEY_PREORDER, type: 'boolean', value: 'false' });
+      console.log(`  🔄 CLEAR preorder_dandenong: ${product.title} / ${variant.title}`);
+    }
+
+    if (metafields.length > 0) {
+      toUpdate.push({ id: variant.id, metafields });
     }
   }
 
@@ -63,10 +186,7 @@ async function syncProduct(product) {
       }
     `, {
       productId: product.id,
-      variants: toUpdate.map(v => ({
-        id: v.id,
-        metafields: [{ namespace: META_NAMESPACE, key: META_KEY, type: 'boolean', value: v.value }]
-      }))
+      variants: toUpdate,
     });
   }
 }
@@ -138,6 +258,8 @@ async function getProductForInventoryItem(inventoryItemId) {
   return getProductById(productId);
 }
 
+// ── Middleware ───────────────────────────────────────────────────────────────
+
 app.use((req, res, next) => {
   let data = '';
   req.on('data', chunk => (data += chunk));
@@ -147,6 +269,8 @@ app.use((req, res, next) => {
     next();
   });
 });
+
+// ── Routes ───────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
   const shop = req.query.shop;
@@ -218,13 +342,11 @@ app.post('/sync-all', async (req, res) => {
   res.send('Full sync started — check server logs');
   console.log('\n🔄 Full sync starting...');
   let cursor = null;
-  let totalSet = 0, totalCleared = 0;
 
   try {
     do {
       const data = await gql(PRODUCT_QUERY, { cursor });
       for (const product of data.products.nodes) {
-        const before = { set: totalSet, cleared: totalCleared };
         await syncProduct(product);
       }
       cursor = data.products.pageInfo.hasNextPage ? data.products.pageInfo.endCursor : null;
@@ -236,4 +358,3 @@ app.post('/sync-all', async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
-
